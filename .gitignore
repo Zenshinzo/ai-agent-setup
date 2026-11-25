@@ -8,3 +8,4 @@ docker/agy/agy
 *.pem
 *webhook*
 !bin/dlog
+__pycache__/

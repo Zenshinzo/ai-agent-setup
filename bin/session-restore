@@ -7,7 +7,6 @@
 #   session-restore --all           restore everything offered, no prompt
 #   session-restore --dry-run       print the tmux commands, run nothing
 #   session-restore --from FILE     use a specific snapshot (.json, or a vault <host>.md)
-#   session-restore --from-vault H  use the vault copy for host H (after a disk loss)
 #   session-restore --include-starter   also offer the claude-main boot session (normally skipped)
 #   session-restore --closed        pick from sessions closed on purpose (kept while restorable) instead
 #   session-restore [--closed] NAME...  restore just these, no prompt
@@ -30,13 +29,6 @@ def tmux_bin():
         if p and os.path.exists(p):
             return [p, "-L", os.environ["SESSION_TMUX_L"]] if os.environ.get("SESSION_TMUX_L") else [p]
     sys.exit("tmux not found")
-
-
-def vault_dir():
-    for p in (os.environ.get("AGENT_VAULT"), os.path.expanduser("~/vault")):
-        if p and os.path.isdir(p):
-            return p
-    sys.exit("vault not found (set AGENT_VAULT)")
 
 
 def load(path):
@@ -63,8 +55,6 @@ def current_epoch():
 
 
 def pick_source(args):
-    if args.from_vault:
-        return os.path.join(vault_dir(), "session-snapshots", args.from_vault + ".md")
     if args.from_file:
         return args.from_file
     if args.closed:
@@ -187,7 +177,6 @@ def main():
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--from", dest="from_file")
-    ap.add_argument("--from-vault", metavar="HOST")
     ap.add_argument("--closed", action="store_true")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--include-starter", action="store_true")
@@ -239,7 +228,7 @@ def main():
     for i, s in enumerate(offer, 1):
         cwd, cmd, what = plan_for(s, tag)
         seen = ago(os.path.getmtime(s["transcript"])) if s.get("transcript") and os.path.exists(s["transcript"]) else ""
-        print("  %2d) %-24s %-10s %-34s %s" % (i, s["name"][:24], cwd[:10], what, seen))
+        print("  %2d) %-24s %-10s %-34s %s" % (i, s["name"][:24], cwd.replace(os.path.expanduser("~"), "~", 1)[-10:], what, seen))
         if (s.get("purpose") or {}).get("text"):
             print("      %s" % s["purpose"]["text"][:110])
     print()

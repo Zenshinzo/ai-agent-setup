@@ -3,7 +3,7 @@
 # window named after the RC session. Start it at boot inside tmux (see README), so the
 # window is a real shell and outlives claude. Restarts claude if it exits;
 # Ctrl-C during the countdown drops to a login shell (window stays alive and usable).
-export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 NAME=$(hostname -s 2>/dev/null || hostname)
 export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX="$NAME"
 if [ -n "${1:-}" ]; then
@@ -12,12 +12,19 @@ else
   # Timestamp the RC session name (vault TZ, like dlog) so the claude.ai/code list shows
   # host_date-time per boot instead of piling up identical host-name entries.
   VAULT="${AGENT_VAULT:-$HOME/vault}"
-  TZ=$(tr -d '[:space:]' < "$VAULT/.vault-tz" 2>/dev/null || true); [ -n "${TZ:-}" ] || TZ="UTC"; export TZ
+  TZ=$( [ -r "$VAULT/.vault-tz" ] && tr -d '[:space:]' < "$VAULT/.vault-tz" || true); [ -n "${TZ:-}" ] || TZ="UTC"; export TZ
   SESSION="${NAME}_$(date +%Y-%m-%d_%H%M%S)"
+fi
+# Mark this tmux session as the boot session, so session-restore skips it by default.
+if [ -n "${TMUX:-}" ]; then
+  STATE="${SESSION_STATE_DIR:-$HOME/.local/state/agent-sessions}"; mkdir -p "$STATE"
+  tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#S' > "$STATE/starter-session" 2>/dev/null || true
 fi
 cd "$HOME" || exit 1
 while :; do
   claude --remote-control "$SESSION"
   printf '\n[claude exited — restarting in 5s; press Ctrl-C now for a shell]\n'
-  sleep 5 || exec bash -l
+  trap 'trap - INT; exec bash -l' INT
+  sleep 5
+  trap - INT
 done

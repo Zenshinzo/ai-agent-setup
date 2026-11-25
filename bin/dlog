@@ -7,7 +7,7 @@
 # what happened to the mirror, so a skip or a failure is visible on the line you already read.
 set -euo pipefail
 VAULT="${AGENT_VAULT:-$HOME/vault}"
-TZ=$(tr -d '[:space:]' < "$VAULT/.vault-tz" 2>/dev/null || true); [ -n "${TZ:-}" ] || TZ="UTC"; export TZ
+TZ=$( [ -r "$VAULT/.vault-tz" ] && tr -d '[:space:]' < "$VAULT/.vault-tz" || true); [ -n "${TZ:-}" ] || TZ="UTC"; export TZ
 FILE="$VAULT/98-Logs/Daily/$(date +%F).md"
 # ---- Session tags + open items -----------------------------------------------
 # 1) Every entry carries the tmux session it came from:  "<tag>: <session> — <text>".
@@ -30,6 +30,7 @@ case "${1:-}" in
     python3 - "$VAULT/98-Logs/Daily" <<'PY'
 import os, re, sys
 d = sys.argv[1]
+if not os.path.isdir(d): print("0 open"); sys.exit(0)
 files = sorted(f for f in os.listdir(d) if re.match(r"^20\d\d-\d\d-\d\d\.md$", f))[-60:]
 opened, closed = {}, set()
 for f in files:
@@ -50,7 +51,7 @@ esac
 TAG=$(hostname -s 2>/dev/null || hostname)
 STAMP="$(date '+%H:%M %z')"
 SESS=""
-if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then SESS=$(tmux display-message -p '#S' 2>/dev/null || true); fi
+if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then SESS=$(tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#S' 2>/dev/null || true); fi
 BODY="$*"
 if [ -n "$SESS" ]; then
   case "$BODY" in "$TAG: $SESS — "*) BODY="${BODY#"$TAG: $SESS — "}" ;; "$TAG: "*) BODY="${BODY#"$TAG: "}" ;; esac

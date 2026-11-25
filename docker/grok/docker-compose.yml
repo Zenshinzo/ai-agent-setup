@@ -7,14 +7,13 @@ services:
   grok:
     build: .
     image: local/grok:1.0.89
-    container_name: grok
     user: "2001:2001"
     working_dir: /work
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs:
-      - /tmp:size=256m
+      - /tmp:size=256m,nosuid,nodev
     volumes:
       - grok-home:/home/grok      # login + Grok state only
       - ./work:/work              # the ONLY host folder it can see

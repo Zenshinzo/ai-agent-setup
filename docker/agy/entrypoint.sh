@@ -1,5 +1,5 @@
 #!/bin/bash
-# Seed agy settings into the home volume on first run (trust /work only); never overwrite a later edit.
+# Reset agy's settings on every start (trust /work only), so nothing the agent writes to them sticks.
 d="$HOME/.gemini/antigravity-cli"; mkdir -p "$d"
-[ -f "$d/settings.json" ] || printf '{\n  "trustedWorkspaces": ["/work"]\n}\n' > "$d/settings.json"
+printf '{\n  "trustedWorkspaces": ["/work"]\n}\n' > "$d/settings.json"
 exec "$@"

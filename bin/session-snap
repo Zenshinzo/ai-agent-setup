@@ -202,7 +202,7 @@ def snapshot(old=None):
            "boot_id": boot_id(), "tmux_server_pid": None, "tmux_server_start": None,
            "starter_session": None, "sessions": []}
     try:
-        hdr["starter_session"] = open("/run/claude-main-session.name").read().strip() or None
+        hdr["starter_session"] = open(os.path.join(STATE, "starter-session")).read().strip() or None
     except OSError:
         pass
     if not tm:
@@ -260,8 +260,8 @@ def snapshot(old=None):
             mt, sid, path = max(cands)
             s["uuid"], s["transcript"] = sid, path
             s["confidence"] = "exact" if len(cands) == 1 else "ambiguous"
-            if not c["label"]:
-                s["confidence"] = "stale"
+            if not c["label"] and len(cands) == 1:
+                s["confidence"] = "stale"            # unlabeled: resume only on a unique match
         c["label"] = label
 
     # A Claude that was /exit-ed leaves a shell behind. Keep the conversation it had as "last",

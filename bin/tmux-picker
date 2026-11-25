@@ -47,18 +47,22 @@ _tp_exec() {
 # survives after Claude exits.
 _tp_claude_session() {
     tmux new-session -d -s "$1"
-    tmux send-keys -t "$1" "claude -n \"$(_tp_htag): $1\"" Enter
-    _tp_exec attach -t "$1"
+    tmux send-keys -t "=$1:" -l "claude -n \"$(_tp_htag): $1\""
+    tmux send-keys -t "=$1:" Enter
+    _tp_exec attach -t "=$1"
 }
 
 _tp_new_session() {
     printf 'New session name (Enter to auto-name): '
     read -r _tp_name || return 0
+    case "$_tp_name" in
+        *[\'\"\`\$\\]*) echo "Session names can't contain quotes, backticks, \$ or backslashes."; return 0 ;;
+    esac
     if [ -z "$_tp_name" ]; then
         _tp_exec new-session
-    elif tmux has-session -t "$_tp_name" 2>/dev/null; then
+    elif tmux has-session -t "=$_tp_name" 2>/dev/null; then
         echo "Session '$_tp_name' already exists -- attaching it."
-        _tp_exec attach -t "$_tp_name"
+        _tp_exec attach -t "=$_tp_name"
     else
         printf 'Start Claude in this session? [Y/n] '
         read -r _tp_ans || return 0
@@ -125,7 +129,7 @@ tmux_session_picker() {
     fi
 
     _tp_target=$(printf '%s\n' "$_tp_sessions" | sed -n "${_tp_pick}p")
-    _tp_exec attach -t "$_tp_target"
+    _tp_exec attach -t "=$_tp_target"
 }
 
 # Sourced from rc (marker set) vs run as a command (marker absent).

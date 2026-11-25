@@ -7,14 +7,13 @@ services:
   gemini:
     build: .
     image: local/gemini-agy:1.5.13
-    container_name: gemini
     user: "2003:2003"
     working_dir: /work
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs:
-      - /tmp:size=256m
+      - /tmp:size=256m,nosuid,nodev
     volumes:
       - gemini-home:/home/gemini     # login + agy state only
       - ./work:/work                 # the ONLY host folder it can see

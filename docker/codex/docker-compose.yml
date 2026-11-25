@@ -7,14 +7,13 @@ services:
   chatgpt:
     build: .
     image: local/chatgpt-codex:0.163.0
-    container_name: chatgpt
     user: "2002:2002"
     working_dir: /work
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs:
-      - /tmp:size=256m
+      - /tmp:size=256m,nosuid,nodev
     volumes:
       - chatgpt-home:/home/chatgpt   # login + Codex state only
       - ./work:/work                 # the ONLY host folder it can see

@@ -1,5 +1,6 @@
 #!/bin/bash
-# Seed Codex config into the home volume on first run; never overwrite a later edit.
+# Reset Codex's config from the image on every start, so nothing the agent writes to it sticks.
+# To change it, edit config.toml in this folder and rebuild.
 mkdir -p "$HOME/.codex"
-[ -f "$HOME/.codex/config.toml" ] || cp /etc/codex-seed/config.toml "$HOME/.codex/config.toml"
+cp /etc/codex-seed/config.toml "$HOME/.codex/config.toml"
 exec "$@"
