@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# dlog — append an entry to today's daily log in your vault. Usage: dlog "what I did"
+# Day boundary + timestamps follow $VAULT/.vault-tz (one timezone across all machines; default UTC).
+#
+# Optional: mirror every entry to a Discord channel. Put the channel's webhook URL in the file
+# named by $DLOG_WEBHOOK (default ~/.config/dlog/webhook). No file = no mirror. Every run says
+# what happened to the mirror, so a skip or a failure is visible on the line you already read.
+set -euo pipefail
+VAULT="${AGENT_VAULT:-$HOME/vault}"
+TZ=$(tr -d '[:space:]' < "$VAULT/.vault-tz" 2>/dev/null || true); [ -n "${TZ:-}" ] || TZ="UTC"; export TZ
+FILE="$VAULT/98-Logs/Daily/$(date +%F).md"
+# ---- Session tags + open items -----------------------------------------------
+# 1) Every entry carries the tmux session it came from:  "<tag>: <session> — <text>".
+#    A session that already typed that prefix is left alone; a bare "<tag>: " is
+#    replaced. Outside tmux nothing is added.
+# 2) Open items:  dlog --open "text"   → "🟡 OPEN #ab12 text"   (prints the id)
+#                 dlog --wait "text"   → "⏳ WAIT #ab12 text"   something running; session is waiting on it
+#                 dlog --close ab12 ["note"] → "✅ CLOSED #ab12 note"
+#                 dlog --open-list     → open items in this clone's last 60 days
+#    An OPEN stays open until its CLOSED.
+# 3) Any other --flag is refused, so "dlog --help" can never become an entry.
+MODE=log; ID=""
+case "${1:-}" in
+  --open) MODE=open; shift ;;
+  --wait) MODE=wait; shift ;;
+  --close)
+    MODE=close; shift; ID="${1:-}"; ID="${ID#\#}"; [ "$#" -ge 1 ] && shift
+    [[ "$ID" =~ ^[0-9a-f]{4}$ ]] || { echo 'usage: dlog --close <4-hex id> ["note"]   (ids: dlog --open-list)'; exit 1; } ;;
+  --open-list)
+    python3 - "$VAULT/98-Logs/Daily" <<'PY'
+import os, re, sys
+d = sys.argv[1]
+files = sorted(f for f in os.listdir(d) if re.match(r"^20\d\d-\d\d-\d\d\.md$", f))[-60:]
+opened, closed = {}, set()
+for f in files:
+    for line in open(os.path.join(d, f), encoding="utf-8", errors="replace"):
+        m = re.search(r"(🟡 OPEN|⏳ WAIT|✅ CLOSED) #([0-9a-f]{4})\b ?(.*)", line)
+        if not m: continue
+        if "CLOSED" not in m.group(1): opened.setdefault(m.group(2), f[5:10] + "  " + line.split(" — ", 1)[-1].strip())
+        else: closed.add(m.group(2))
+left = [(k, v) for k, v in opened.items() if k not in closed]
+for k, v in left: print(f"#{k}  {v}")
+print(f"{len(left)} open")
+PY
+    exit 0 ;;
+  --*) echo 'usage: dlog "what I did" | dlog --open "text" | dlog --wait "text" | dlog --close <id> ["note"] | dlog --open-list'; exit 1 ;;
+esac
+[ "$MODE" = close ] || [ "$#" -ge 1 ] || { echo 'usage: dlog "what I did"'; exit 1; }
+[ -f "$FILE" ] || { mkdir -p "$(dirname "$FILE")"; printf '# %s\n\n' "$(date +%F)" > "$FILE"; }
+TAG=$(hostname -s 2>/dev/null || hostname)
+STAMP="$(date '+%H:%M %z')"
+SESS=""
+if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then SESS=$(tmux display-message -p '#S' 2>/dev/null || true); fi
+BODY="$*"
+if [ -n "$SESS" ]; then
+  case "$BODY" in "$TAG: $SESS — "*) BODY="${BODY#"$TAG: $SESS — "}" ;; "$TAG: "*) BODY="${BODY#"$TAG: "}" ;; esac
+fi
+case "$MODE" in
+  open)  ID=$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n'); BODY="🟡 OPEN #$ID $BODY" ;;
+  wait)  ID=$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n'); BODY="⏳ WAIT #$ID $BODY" ;;
+  close) BODY="✅ CLOSED #$ID${BODY:+ $BODY}" ;;
+esac
+TEXT="$BODY"; [ -n "$SESS" ] && TEXT="$TAG: $SESS — $BODY"
+# The vault write happens FIRST and unconditionally. Nothing about the mirror
+# may ever cost us the log entry itself.
+printf -- '- **%s** - %s — %s\n' "$TAG" "$STAMP" "$TEXT" >> "$FILE"
+# Mirror to Discord (fire-and-forget; never blocks logging). Host-prefixed.
+WEBHOOK_FILE="${DLOG_WEBHOOK:-$HOME/.config/dlog/webhook}"
+MIRROR="off (no $WEBHOOK_FILE)"
+if [ -f "$WEBHOOK_FILE" ]; then
+  MSG="**$TAG** - $STAMP — $TEXT"
+  [ ${#MSG} -gt 1900 ] && MSG="${MSG:0:1880}… (full entry in vault)"
+  PAYLOAD=$(printf '%s' "$MSG" | python3 -c "import sys,json;print(json.dumps({'content':sys.stdin.read()}))" 2>/dev/null || true)
+  if [ -n "$PAYLOAD" ]; then
+    # `|| true` so a curl failure cannot trip `set -e` and lose the report. Do
+    # NOT `|| echo 000` here: curl's own -w already emits 000 on failure, and
+    # the two concatenate into a nonsense "000000" that matches no case arm.
+    CODE=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Content-Type: application/json" \
+             -d "$PAYLOAD" "$(tr -d '[:space:]' < "$WEBHOOK_FILE")" 2>/dev/null || true)
+    [ -n "$CODE" ] || CODE=000
+    case "$CODE" in
+      2*) MIRROR="sent" ;;
+      000) MIRROR="FAILED (no response — webhook unreachable?)" ;;
+      *)  MIRROR="FAILED (http $CODE)" ;;
+    esac
+  else
+    MIRROR="FAILED (could not build payload)"
+  fi
+fi
+echo "logged → $(basename "$FILE") [discord: $MIRROR]: $TEXT"
+{ [ "$MODE" = open ] || [ "$MODE" = wait ]; } && echo "open item id: #$ID  (close with: dlog --close $ID \"note\")"
+true

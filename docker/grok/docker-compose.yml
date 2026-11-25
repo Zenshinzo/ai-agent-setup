@@ -1,0 +1,26 @@
+# Grok Build CLI, isolated in its own container.
+# Run:   docker compose -f docker-compose.yml run --rm grok grok -p "..."
+# Login: docker compose -f docker-compose.yml run --rm grok grok login --device-auth
+name: grok
+
+services:
+  grok:
+    build: .
+    image: local/grok:1.0.89
+    container_name: grok
+    user: "2001:2001"
+    working_dir: /work
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=256m
+    volumes:
+      - grok-home:/home/grok      # login + Grok state only
+      - ./work:/work              # the ONLY host folder it can see
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 512
+
+volumes:
+  grok-home:

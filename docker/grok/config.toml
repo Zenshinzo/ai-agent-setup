@@ -1,0 +1,20 @@
+# Grok in its container. Nothing from Claude/Cursor/Codex exists in here, and these
+# switches keep it that way if anything is ever mounted by mistake.
+[compat.claude]
+skills = false
+rules = false
+agents = false
+mcps = false
+hooks = false
+sessions = false
+
+[compat.cursor]
+skills = false
+rules = false
+agents = false
+mcps = false
+hooks = false
+sessions = false
+
+[compat.codex]
+sessions = false

@@ -1,0 +1,3 @@
+# Example policy: Codex reviews, it doesn't change things. Claude is the one agent that edits.
+# read-only is the default sandbox for every codex run in this container. No MCP servers configured.
+sandbox_mode = "read-only"

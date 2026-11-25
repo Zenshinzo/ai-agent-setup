@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+# session-snap — record every live tmux session's name, cwd and Claude conversation UUID,
+# so session-restore can rebuild them after a reboot. Read-only on ~/.claude/projects/.
+# Python 3.9-compatible on purpose (older macOS ships python3 3.9).
+import fcntl, glob, json, os, re, shutil, socket, subprocess, sys, time
+
+# SESSION_TMUX_L / SESSION_STATE_DIR exist for testing on an isolated tmux server — never set in production.
+STATE = os.environ.get("SESSION_STATE_DIR") or os.path.expanduser("~/.local/state/agent-sessions")
+LATEST = os.path.join(STATE, "latest.json")
+PREV = os.path.join(STATE, "prev.json")          # last snapshot of the previous tmux epoch
+HIST = os.path.join(STATE, "history")
+PURPOSES = os.path.join(STATE, "purposes.json")  # written by session-purpose; read here
+CLOSED = os.path.join(STATE, "closed.json")      # sessions closed on purpose (not by a reboot)
+HIST_DAYS = 14
+# Closed sessions never age out. One drops off only when its conversation can no longer be resumed.
+SLACK = 120                                      # seconds of mtime slack vs process start
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+PASTE_RE = re.compile(r"</?pasted_content[^>]*>")
+RANK = {"manual": 3, "claude": 2, "first-prompt": 1}   # who wins when several set a purpose
+
+
+def htag():
+    return socket.gethostname().split(".")[0]
+
+
+def tmux_bin():
+    for p in (shutil.which("tmux"), "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
+        if p and os.path.exists(p):
+            return [p, "-L", os.environ["SESSION_TMUX_L"]] if os.environ.get("SESSION_TMUX_L") else [p]
+    return None
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return ""
+
+
+def boot_id():
+    try:
+        return open("/proc/sys/kernel/random/boot_id").read().strip()
+    except OSError:
+        out = run(["sysctl", "-n", "kern.boottime"])          # macOS: { sec = 1700000000, ... }
+        m = re.search(r"sec = (\d+)", out)
+        return "darwin-" + (m.group(1) if m else "unknown")
+
+
+def parse_etime(s):
+    # [[dd-]hh:]mm:ss  →  seconds
+    d = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+    parts = [int(x) for x in s.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return int(d) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def processes():
+    """pid -> {ppid, start, argv}. argv is exact from /proc on Linux, best-effort on macOS."""
+    now = time.time()
+    procs = {}
+    for line in run(["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "etime=", "-o", "command="]).splitlines():
+        f = line.split(None, 3)
+        if len(f) < 4:
+            continue
+        pid, ppid = int(f[0]), int(f[1])
+        try:
+            start = now - parse_etime(f[2])
+        except ValueError:
+            continue
+        argv = None
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as fh:
+                argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
+        except OSError:
+            pass
+        procs[pid] = {"ppid": ppid, "start": start, "argv": argv or f[3].split(), "exact": argv is not None}
+    return procs
+
+
+def is_claude(argv):
+    return bool(argv) and os.path.basename(argv[0]) == "claude"
+
+
+def parse_claude(argv, exact):
+    """→ (label, resume_uuid, extra_args)"""
+    label, uuid, extra, i = None, None, [], 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-n", "--name") and i + 1 < len(argv):
+            if exact:
+                label, i = argv[i + 1], i + 2
+            else:                                   # ps lost quoting: name runs to the next flag
+                j = i + 1
+                while j < len(argv) and not argv[j].startswith("-"):
+                    j += 1
+                label, i = " ".join(argv[i + 1:j]), j
+            continue
+        if a.startswith("--name="):
+            label = a.split("=", 1)[1]
+        elif a in ("-r", "--resume") and i + 1 < len(argv) and UUID_RE.match(argv[i + 1]):
+            uuid, i = argv[i + 1], i + 2
+            continue
+        elif a.startswith("--resume=") and UUID_RE.match(a.split("=", 1)[1]):
+            uuid = a.split("=", 1)[1]
+        else:
+            extra.append(a)
+        i += 1
+    return label, uuid, extra
+
+
+def proc_cwd(pid):
+    try:
+        return os.readlink("/proc/%d/cwd" % pid)
+    except OSError:
+        out = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
+        for l in out.splitlines():
+            if l.startswith("n"):
+                return l[1:]
+    return None
+
+
+def transcript_index():
+    """customTitle -> [(mtime, uuid, path)], plus uuid -> (title, path). Reads line 1 only."""
+    by_title, by_uuid = {}, {}
+    for f in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+        try:
+            with open(f, "r", errors="replace") as fh:
+                j = json.loads(fh.readline())
+            mt = os.path.getmtime(f)
+        except Exception:
+            continue
+        sid = os.path.basename(f)[:-6]
+        title = j.get("customTitle") if j.get("type") == "custom-title" else None
+        by_uuid[sid] = (title, f, mt)
+        if title:
+            by_title.setdefault(title, []).append((mt, sid, f))
+    return by_title, by_uuid
+
+
+def first_prompt(path):
+    """The first thing typed into the conversation, one line, ≤160 chars. Fallback purpose only."""
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for n, line in enumerate(fh):
+                if n > 3000:
+                    break
+                if '"type":"user"' not in line:
+                    continue
+                j = json.loads(line)
+                if j.get("type") != "user" or j.get("isMeta"):
+                    continue
+                c = (j.get("message") or {}).get("content")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+                if not isinstance(c, str):
+                    continue
+                c = " ".join(PASTE_RE.sub(" ", c).split())
+                if c and not c.startswith("<"):           # skip <command-name>, <local-command-…> etc.
+                    return c[:160]
+    except Exception:
+        pass
+    return None
+
+
+def load_purposes():
+    try:
+        return json.load(open(PURPOSES))
+    except Exception:
+        return {}
+
+
+def ident(s):
+    """(uuid, transcript) for a session — its live Claude's, else the one it last had."""
+    last = s.get("last") or {}
+    return s.get("uuid") or last.get("uuid"), s.get("transcript") or last.get("transcript")
+
+
+def restorable(s):
+    """Can `session-restore --closed` still bring its conversation back? Needs the UUID and its
+    transcript on this host (Claude deletes transcripts after cleanupPeriodDays)."""
+    uuid, transcript = ident(s)
+    return bool(uuid and transcript and os.path.exists(transcript))
+
+
+def purpose_for(s, purposes):
+    uuid, transcript = ident(s)
+    cands = [e for e in ((purposes.get("by_uuid") or {}).get(uuid) if uuid else None,
+                         (purposes.get("by_name") or {}).get(s["name"])) if e]
+    if cands:
+        return max(cands, key=lambda e: (RANK.get(e.get("source"), 0), e.get("set_at", 0)))
+    fp = first_prompt(transcript) if transcript else None
+    return {"text": fp, "source": "first-prompt"} if fp else None
+
+
+def snapshot(old=None):
+    tm = tmux_bin()
+    tag = htag()
+    hdr = {"host": socket.gethostname(), "htag": tag, "snapshot_time": int(time.time()),
+           "boot_id": boot_id(), "tmux_server_pid": None, "tmux_server_start": None,
+           "starter_session": None, "sessions": []}
+    try:
+        hdr["starter_session"] = open("/run/claude-main-session.name").read().strip() or None
+    except OSError:
+        pass
+    if not tm:
+        return hdr
+    srv = run(tm + ["display-message", "-p", "#{pid} #{start_time}"]).split()
+    if len(srv) == 2:
+        hdr["tmux_server_pid"], hdr["tmux_server_start"] = int(srv[0]), int(srv[1])
+    fmt = "\t".join(["#{session_name}", "#{session_created}", "#{session_attached}", "#{session_windows}",
+                     "#{window_index}.#{pane_index}", "#{pane_pid}", "#{pane_current_path}"])
+    panes = [l.split("\t") for l in run(tm + ["list-panes", "-a", "-F", fmt]).splitlines() if l.count("\t") == 6]
+    if not panes:
+        return hdr
+    procs = processes()
+    kids = {}
+    for pid, p in procs.items():
+        kids.setdefault(p["ppid"], []).append(pid)
+    by_title, by_uuid = transcript_index()
+
+    sessions = {}
+    for name, created, attached, nwin, pane, ppid, pcwd in panes:
+        s = sessions.setdefault(name, {"name": name, "created": int(created), "attached": int(attached) > 0,
+                                       "windows": int(nwin), "panes": 0, "cwd": pcwd, "claude": None})
+        s["panes"] += 1
+        if s["claude"]:
+            continue
+        stack = [int(ppid)]                          # first claude found under any pane wins
+        while stack:
+            pid = stack.pop(0)
+            p = procs.get(pid)
+            if p and is_claude(p["argv"]):
+                label, uuid, extra = parse_claude(p["argv"], p["exact"])
+                s["claude"] = {"pid": pid, "pane": pane, "label": label, "resume_arg": uuid,
+                               "start": int(p["start"]), "cwd": proc_cwd(pid) or pcwd,
+                               "extra_args": extra}
+                break
+            stack.extend(kids.get(pid, []))
+
+    for s in sessions.values():
+        c = s["claude"]
+        s["starter"] = (s["name"] == hdr["starter_session"])
+        s["uuid"], s["transcript"], s["confidence"] = None, None, "none"
+        if not c:
+            s["confidence"] = "shell"
+            continue
+        if c["resume_arg"] and c["resume_arg"] in by_uuid:
+            title, path, _ = by_uuid[c["resume_arg"]]
+            s["uuid"], s["transcript"], s["confidence"] = c["resume_arg"], path, "exact"
+            c["label"] = c["label"] or title
+            continue
+        label = c["label"] or "%s: %s" % (tag, s["name"])
+        cands = [x for x in by_title.get(label, []) if x[0] >= c["start"] - SLACK]
+        if not cands:                                # live but quiet since it started? take any match
+            cands = by_title.get(label, [])
+        if cands:
+            mt, sid, path = max(cands)
+            s["uuid"], s["transcript"] = sid, path
+            s["confidence"] = "exact" if len(cands) == 1 else "ambiguous"
+            if not c["label"]:
+                s["confidence"] = "stale"
+        c["label"] = label
+
+    # A Claude that was /exit-ed leaves a shell behind. Keep the conversation it had as "last",
+    # so closing the session afterwards still records what to resume (never used after a reboot).
+    if old and epoch(old) == epoch(hdr):
+        before = {(o["name"], o["created"]): o for o in old.get("sessions", [])}
+        for s in sessions.values():
+            o = before.get((s["name"], s["created"]))
+            if s["claude"] or not o:
+                continue
+            if o.get("claude") and o.get("uuid"):
+                s["last"] = {"uuid": o["uuid"], "transcript": o.get("transcript"), "label": o["claude"].get("label"),
+                             "cwd": o["claude"].get("cwd"), "confidence": o.get("confidence")}
+            elif o.get("last"):
+                s["last"] = o["last"]
+    purposes = load_purposes()
+    for s in sessions.values():
+        s["purpose"] = purpose_for(s, purposes)
+    hdr["sessions"] = sorted(sessions.values(), key=lambda x: x["created"])
+    hdr["session_count"] = len(hdr["sessions"])
+    return hdr
+
+
+def epoch(s):
+    return (s.get("boot_id"), s.get("tmux_server_pid"), s.get("tmux_server_start"))
+
+
+def fingerprint(s):
+    return json.dumps([(x["name"], x["uuid"], x["cwd"]) for x in s.get("sessions", [])])
+
+
+def write_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=1)
+    os.replace(tmp, path)
+
+
+def update_closed(old, snap):
+    """Sessions that vanished within the same tmux epoch were closed on purpose — archive them,
+    so `session-restore --closed` can bring one back later. A reboot is prev.json's job, not this."""
+    try:
+        closed = json.load(open(CLOSED))
+    except Exception:
+        closed = []
+    if old and epoch(old) == epoch(snap):
+        now_keys = {(x["name"], x["created"]) for x in snap["sessions"]}
+        now_uuids = {ident(x)[0] for x in snap["sessions"]} - {None}
+        for o in old.get("sessions", []):
+            uuid = ident(o)[0]
+            if (o["name"], o["created"]) in now_keys or o.get("starter") or uuid in now_uuids:
+                continue                              # still here, the boot session, or just renamed
+            if not (o.get("claude") or o.get("last")):
+                continue                              # a plain shell — nothing worth bringing back
+            rec = dict(o, closed_at=int(time.time()))
+            closed = [c for c in closed if not (ident(c)[0] == uuid if uuid else c["name"] == o["name"])]
+            closed.append(rec)
+    live_uuids = {ident(x)[0] for x in snap["sessions"]} - {None}
+    closed = sorted((c for c in closed if restorable(c) and ident(c)[0] not in live_uuids),
+                    key=lambda c: -c["closed_at"])           # restored again → off the closed list
+    write_json(CLOSED, closed)
+    return closed
+
+
+def main():
+    os.makedirs(HIST, exist_ok=True)
+    with open(os.path.join(STATE, ".lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        old = None
+        try:
+            old = json.load(open(LATEST))
+        except Exception:
+            pass
+        snap = snapshot(old)
+        snap["closed"] = update_closed(old, snap)
+        # A new boot or a new tmux server means the old sessions are gone: keep the last
+        # snapshot of that epoch as prev.json BEFORE overwriting — that is what restore reads.
+        # Only a snapshot with real (non-starter) sessions may replace prev.json, so a second
+        # crash before anyone restores can't overwrite the good copy with an empty boot.
+        if old and epoch(old) != epoch(snap) and any(not x.get("starter") for x in old.get("sessions", [])):
+            write_json(PREV, old)
+        write_json(LATEST, snap)
+        if not old or fingerprint(old) != fingerprint(snap):
+            write_json(os.path.join(HIST, time.strftime("%Y%m%d-%H%M%S") + ".json"), snap)
+        cutoff = time.time() - HIST_DAYS * 86400
+        for f in glob.glob(os.path.join(HIST, "*.json")):
+            if os.path.getmtime(f) < cutoff:
+                os.remove(f)
+    if "-v" in sys.argv or "--print" in sys.argv:
+        for s in snap["sessions"]:
+            p = s.get("purpose") or {}
+            print("%-26s %-9s %-36s %s" % (s["name"], s["confidence"], s["uuid"] or "", (p.get("text") or "")[:60]))
+        print("%d sessions → %s" % (len(snap["sessions"]), LATEST))
+
+
+if __name__ == "__main__":
+    main()

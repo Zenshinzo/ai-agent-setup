@@ -1,0 +1,142 @@
+#!/bin/sh
+# tmux-picker — on-connect tmux session picker.
+#   Install to ~/.local/bin/tmux-picker (mode 755) on every box you ssh into.
+#
+# Two modes:
+#
+#   1. Sourced from an rc file (the login path). The rc hook must set the
+#      TMUX_PICKER_RC marker so the script knows it is being sourced:
+#
+#          if [ -r "$HOME/.local/bin/tmux-picker" ]; then
+#            TMUX_PICKER_RC=1
+#            . "$HOME/.local/bin/tmux-picker"
+#            unset TMUX_PICKER_RC
+#          fi
+#
+#      Full guards apply (interactive shells / real TTY / once per shell / not
+#      already in tmux / not VS Code). `exec tmux` replaces the login shell, so
+#      detaching closes the connection — same behavior as the old inline blocks.
+#      (The marker is used instead of inspecting $0 because zsh's FUNCTION_ARGZERO
+#      rewrites $0 to the sourced file's path, making a sourced run indistinguishable
+#      from a direct one.)
+#
+#   2. Run as a command: `tmux-picker` at any shell prompt. The interactive and
+#      once-per-shell guards are skipped (a script is a non-interactive shell);
+#      `exec tmux` replaces the script process, so detaching returns you to the
+#      shell you invoked it from.
+#
+# Escape hatches:  NO_TMUX=1  bypasses entirely.
+#                  ITERM_CC=1 (iTerm on macOS only) uses tmux control mode (-CC, native tabs).
+
+# Short host tag for Claude session display names (same convention dlog uses).
+_tp_htag() {
+    _tp_h=$(hostname -s 2>/dev/null || hostname)
+    printf '%s' "$_tp_h"
+}
+
+# Hand off to tmux, honoring iTerm control mode only when explicitly enabled.
+_tp_exec() {
+    if [ -n "${ITERM_CC-}" ] && [ "${TERM_PROGRAM-}" = "iTerm.app" ]; then
+        exec tmux -CC "$@"
+    fi
+    exec tmux "$@"
+}
+
+# Create $1 detached, start Claude in it, then attach. Claude runs as a command
+# inside the session's shell (not as the session's process), so the shell
+# survives after Claude exits.
+_tp_claude_session() {
+    tmux new-session -d -s "$1"
+    tmux send-keys -t "$1" "claude -n \"$(_tp_htag): $1\"" Enter
+    _tp_exec attach -t "$1"
+}
+
+_tp_new_session() {
+    printf 'New session name (Enter to auto-name): '
+    read -r _tp_name || return 0
+    if [ -z "$_tp_name" ]; then
+        _tp_exec new-session
+    elif tmux has-session -t "$_tp_name" 2>/dev/null; then
+        echo "Session '$_tp_name' already exists -- attaching it."
+        _tp_exec attach -t "$_tp_name"
+    else
+        printf 'Start Claude in this session? [Y/n] '
+        read -r _tp_ans || return 0
+        case "$_tp_ans" in
+            [Nn]*) _tp_exec new-session -s "$_tp_name" ;;
+            *)     _tp_claude_session "$_tp_name" ;;
+        esac
+    fi
+}
+
+tmux_session_picker() {
+    command -v tmux >/dev/null 2>&1 || return 0
+    [ -n "${NO_TMUX-}" ] && return 0
+
+    if [ -n "${TMUX-}" ]; then                       # never nest
+        [ -n "${TMUX_PICKER_DIRECT-}" ] && echo 'Already inside a tmux session.'
+        return 0
+    fi
+    case "$TERM" in screen*|tmux*) return 0 ;; esac
+    [ -t 0 ] && [ -t 1 ] || return 0                 # real TTY only
+
+    if [ -z "${TMUX_PICKER_DIRECT-}" ]; then         # rc/login mode only
+        case $- in *i*) ;; *) return 0 ;; esac       # interactive shells only
+        [ -z "${VSCODE_INJECTION-}" ] || return 0    # skip VS Code terminal
+        [ "${TERM_PROGRAM-}" != "vscode" ] || return 0
+        [ -n "${TMUX_PICKER_HANDLED-}" ] && return 0 # once per shell
+        TMUX_PICKER_HANDLED=1
+        export TMUX_PICKER_HANDLED
+    fi
+
+    _tp_sessions=$(tmux ls -F '#{session_name}' 2>/dev/null)
+
+    # No sessions at all -> offer Claude (default yes), then create and attach "main".
+    if [ -z "$_tp_sessions" ]; then
+        printf 'No sessions found. Start Claude in this session? [Y/n] '
+        read -r _tp_ans || return 0
+        case "$_tp_ans" in
+            [Nn]*) _tp_exec new-session -s main ;;
+            *)     _tp_claude_session main ;;
+        esac
+        return 0
+    fi
+
+    _tp_count=$(printf '%s\n' "$_tp_sessions" | wc -l | tr -d ' ')
+
+    echo 'Current tmux sessions:'
+    tmux ls -F '#{session_name}: #{session_windows} window(s)#{?session_attached, (attached),}' 2>/dev/null \
+        | awk '{ printf "  %d) %s\n", NR, $0 }'
+    if [ "$_tp_count" -eq 1 ]; then
+        printf '[Enter=1, n=new]: '
+    else
+        printf '[Enter=1, 2-%s attach, n=new]: ' "$_tp_count"
+    fi
+    read -r _tp_pick || return 0
+
+    case "$_tp_pick" in
+        '')          _tp_pick=1 ;;
+        [Nn]*)       _tp_new_session; return 0 ;;
+        0|*[!0-9]*)  echo "Not a choice -- attaching 1."; _tp_pick=1 ;;
+    esac
+    if [ "$_tp_pick" -gt "$_tp_count" ]; then
+        echo "Out of range -- attaching 1."
+        _tp_pick=1
+    fi
+
+    _tp_target=$(printf '%s\n' "$_tp_sessions" | sed -n "${_tp_pick}p")
+    _tp_exec attach -t "$_tp_target"
+}
+
+# Sourced from rc (marker set) vs run as a command (marker absent).
+if [ -z "${TMUX_PICKER_RC-}" ]; then
+    TMUX_PICKER_DIRECT=1
+fi
+
+tmux_session_picker
+
+# Reached only when the picker bails out (guards, NO_TMUX, ^D) — an attach/new
+# session execs and never returns here. Leave the shell as we found it.
+unset TMUX_PICKER_DIRECT
+unset _tp_sessions _tp_count _tp_pick _tp_target _tp_ans _tp_name _tp_h 2>/dev/null
+unset -f _tp_htag _tp_exec _tp_claude_session _tp_new_session tmux_session_picker 2>/dev/null

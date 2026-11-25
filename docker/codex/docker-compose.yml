@@ -1,0 +1,26 @@
+# Codex CLI, isolated in its own container.
+# Run:   docker compose -f docker-compose.yml run --rm -T chatgpt codex exec --skip-git-repo-check "..." < /dev/null
+# Login: docker compose -f docker-compose.yml run --rm chatgpt codex login --device-auth
+name: chatgpt
+
+services:
+  chatgpt:
+    build: .
+    image: local/chatgpt-codex:0.163.0
+    container_name: chatgpt
+    user: "2002:2002"
+    working_dir: /work
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=256m
+    volumes:
+      - chatgpt-home:/home/chatgpt   # login + Codex state only
+      - ./work:/work                 # the ONLY host folder it can see
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 512
+
+volumes:
+  chatgpt-home:

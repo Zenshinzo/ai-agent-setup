@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+# session-restore — rebuild tmux sessions + their Claude conversations from a session-snap
+# snapshot. Manual by design: shows a numbered list, you pick. Never touches a live session.
+# Python 3.9-compatible on purpose (older macOS ships python3 3.9).
+#
+#   session-restore                 pick from the last snapshot before this boot / tmux server
+#   session-restore --all           restore everything offered, no prompt
+#   session-restore --dry-run       print the tmux commands, run nothing
+#   session-restore --from FILE     use a specific snapshot (.json, or a vault <host>.md)
+#   session-restore --from-vault H  use the vault copy for host H (after a disk loss)
+#   session-restore --include-starter   also offer the claude-main boot session (normally skipped)
+#   session-restore --closed        pick from sessions closed on purpose (kept while restorable) instead
+#   session-restore [--closed] NAME...  restore just these, no prompt
+#   session-restore --check [NAME]  closing a session? check the snapshot has everything to bring it back
+import argparse, json, os, re, shlex, shutil, socket, subprocess, sys, time
+
+# SESSION_TMUX_L / SESSION_STATE_DIR exist for testing on an isolated tmux server — never set in production.
+STATE = os.environ.get("SESSION_STATE_DIR") or os.path.expanduser("~/.local/state/agent-sessions")
+LATEST = os.path.join(STATE, "latest.json")
+PREV = os.path.join(STATE, "prev.json")
+RESUMABLE = ("exact", "stale")              # ambiguous / none are never resumed — plain shell instead
+
+
+def htag():
+    return socket.gethostname().split(".")[0]
+
+
+def tmux_bin():
+    for p in (shutil.which("tmux"), "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
+        if p and os.path.exists(p):
+            return [p, "-L", os.environ["SESSION_TMUX_L"]] if os.environ.get("SESSION_TMUX_L") else [p]
+    sys.exit("tmux not found")
+
+
+def vault_dir():
+    for p in (os.environ.get("AGENT_VAULT"), os.path.expanduser("~/vault")):
+        if p and os.path.isdir(p):
+            return p
+    sys.exit("vault not found (set AGENT_VAULT)")
+
+
+def load(path):
+    text = open(path).read()
+    if path.endswith(".md"):
+        m = re.search(r"```json\n(.*?)\n```", text, re.S)
+        if not m:
+            sys.exit("no ```json block in " + path)
+        text = m.group(1)
+    return json.loads(text)
+
+
+def current_epoch():
+    try:
+        boot = open("/proc/sys/kernel/random/boot_id").read().strip()
+    except OSError:
+        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
+        m = re.search(r"sec = (\d+)", out)
+        boot = "darwin-" + (m.group(1) if m else "unknown")
+    out = subprocess.run(TMUX + ["display-message", "-p", "#{pid} #{start_time}"],
+                         capture_output=True, text=True).stdout.split()
+    pid, start = (int(out[0]), int(out[1])) if len(out) == 2 else (None, None)
+    return (boot, pid, start)
+
+
+def pick_source(args):
+    if args.from_vault:
+        return os.path.join(vault_dir(), "session-snapshots", args.from_vault + ".md")
+    if args.from_file:
+        return args.from_file
+    if args.closed:
+        return LATEST                              # the closed archive rides in every latest.json
+    # prev.json = the last snapshot of an earlier boot/tmux server. Use it if it IS earlier;
+    # otherwise nothing has died since, and latest.json is the right reference.
+    if os.path.exists(PREV):
+        p = load(PREV)
+        if (p.get("boot_id"), p.get("tmux_server_pid"), p.get("tmux_server_start")) != current_epoch():
+            return PREV
+    return LATEST
+
+
+def live_sessions():
+    out = subprocess.run(TMUX + ["list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
+    return set(out.stdout.splitlines())
+
+
+def ago(ts):
+    d = int(time.time() - ts)
+    for n, u in ((86400, "d"), (3600, "h"), (60, "m")):
+        if d >= n:
+            return "%d%s ago" % (d // n, u)
+    return "just now"
+
+
+def effective(s):
+    """A session whose Claude was /exit-ed before it closed: restore the conversation it last had."""
+    last = s.get("last")
+    if s.get("claude") or not last:
+        return s
+    return dict(s, uuid=last.get("uuid"), transcript=last.get("transcript"), confidence=last.get("confidence"),
+                claude={"label": last.get("label"), "cwd": last.get("cwd")})
+
+
+def plan_for(s, tag):
+    c = s.get("claude") or {}
+    cwd = c.get("cwd") or s.get("cwd") or os.path.expanduser("~")
+    if not os.path.isdir(cwd):
+        cwd = os.path.expanduser("~")
+    uuid = s.get("uuid")
+    if c and uuid and s.get("confidence") in RESUMABLE and s.get("transcript") and os.path.exists(s["transcript"]):
+        label = c.get("label") or "%s: %s" % (tag, s["name"])
+        extra = os.environ.get("SESSION_CLAUDE_ARGS", "")   # testing only, e.g. hooks off
+        cmd = "claude --resume %s -n %s" % (uuid, shlex.quote(label)) + (" " + extra if extra else "")
+        return cwd, cmd, "resume " + uuid[:8]
+    why = {"shell": "was a plain shell", "ambiguous": "AMBIGUOUS — shell only",
+           "none": "no conversation found — shell only"}.get(s.get("confidence"), "transcript missing — shell only")
+    return cwd, None, why
+
+
+def parse_pick(ans, n):
+    ans = ans.strip().lower()
+    if ans in ("a", "all"):
+        return list(range(n))
+    if ans in ("", "n", "none", "q", "quit"):
+        return []
+    out = []
+    for part in re.split(r"[,\s]+", ans):
+        if not part:
+            continue
+        m = re.match(r"^(\d+)-(\d+)$", part)
+        rng = range(int(m.group(1)), int(m.group(2)) + 1) if m else [int(part)] if part.isdigit() else None
+        if rng is None:
+            sys.exit("can't read %r" % part)
+        out.extend(i - 1 for i in rng if 1 <= i <= n)
+    return sorted(set(out))
+
+
+def check(name):
+    """Before closing a session: is everything restore needs actually in the snapshot? Exit 1 if not."""
+    exe = os.path.join(os.path.dirname(os.path.realpath(__file__)), "session-snap")
+    subprocess.run([exe if os.path.exists(exe) else "session-snap"], check=False)
+    if not name:
+        pane = os.environ.get("TMUX_PANE") or sys.exit("not inside tmux — give the session name")
+        name = subprocess.run(TMUX + ["display-message", "-p", "-t", pane, "#S"],
+                              capture_output=True, text=True).stdout.strip()
+    snap = load(LATEST)
+    s = next((x for x in snap.get("sessions", []) if x["name"] == name), None)
+    if not s:
+        sys.exit("no live session called %r in the snapshot" % name)
+    e = effective(s)
+    c = e.get("claude") or {}
+    cwd = c.get("cwd") or s.get("cwd")
+    p = s.get("purpose") or {}
+    problems, notes = [], []
+    if not c:
+        notes.append("no Claude in it — it would come back as a plain shell (nothing to resume)")
+    else:
+        if e is not s:
+            notes.append("its Claude already exited — restore uses the conversation it last had")
+        if e.get("confidence") not in RESUMABLE or not e.get("uuid"):
+            problems.append("conversation not matched (%s) — would come back as a shell. Fix: Claude must "
+                            "run as `claude -n \"<htag>: %s\"`, one Claude per label" % (e.get("confidence"), name))
+        elif not (e.get("transcript") and os.path.exists(e["transcript"])):
+            problems.append("transcript file is missing — the conversation can't be resumed")
+    if not (cwd and os.path.isdir(cwd)):
+        problems.append("folder %r no longer exists — would open in $HOME" % cwd)
+    if not p.get("text"):
+        problems.append("no purpose — set one: session-purpose -s %s \"<what it is for>\"" % shlex.quote(name))
+    elif p.get("source") == "first-prompt":
+        problems.append("purpose is only the first prompt (%r) — set a real one with session-purpose"
+                        % p["text"][:60])
+    print("session    %s" % name)
+    print("purpose    %s  [%s]" % (p.get("text") or "—", p.get("source") or "-"))
+    print("restores   %s in %s" % (("claude --resume %s -n %s" % (e["uuid"], shlex.quote(c.get("label") or "")))
+                                   if c and e.get("uuid") else "a shell", cwd))
+    for n in notes:
+        print("note       " + n)
+    for pr in problems:
+        print("MISSING    " + pr)
+    print("READY — closing it is safe, `session-restore --closed %s` brings it back" % shlex.quote(name)
+          if not problems else "NOT READY — fix the above before closing")
+    sys.exit(1 if problems else 0)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("names", nargs="*", help="restore just these sessions, no prompt")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--from", dest="from_file")
+    ap.add_argument("--from-vault", metavar="HOST")
+    ap.add_argument("--closed", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--include-starter", action="store_true")
+    ap.add_argument("--stagger", type=float, default=1.0, help="seconds between restores (default 1)")
+    args = ap.parse_args()
+    if args.check:
+        return check(args.names[0] if args.names else None)
+
+    # macOS: a tmux server started from an ssh login can't reach the login keychain, so every
+    # Claude it spawns comes up "Not logged in". Only a server started from the Mac's own
+    # Terminal works — refuse to be the one that starts it over ssh.
+    if (sys.platform == "darwin" and os.environ.get("SSH_CONNECTION") and not args.dry_run
+            and subprocess.run(TMUX + ["has-session"], capture_output=True).returncode != 0):
+        sys.exit("No tmux server running, and this is an ssh login on macOS: Claudes started from here\n"
+                 "can't reach the keychain and would come up 'Not logged in'.\n"
+                 "Run session-restore from Terminal on the Mac itself (or open tmux there first).")
+    src = pick_source(args)
+    if not os.path.exists(src):
+        sys.exit("no snapshot at %s" % src)
+    snap = load(src)
+    tag = htag()
+    live = live_sessions()
+    if args.closed:                               # newest first; a name closed twice → only its latest
+        seen, pool = set(), []
+        for s in snap.get("closed", []):
+            if s["name"] not in seen:
+                seen.add(s["name"])
+                pool.append(effective(s))
+    else:
+        pool = snap.get("sessions", [])
+    if args.names:
+        missing = [n for n in args.names if n not in {s["name"] for s in pool}]
+        if missing:
+            sys.exit("not in this snapshot%s: %s" % (" (closed list)" if args.closed else "", ", ".join(missing)))
+        pool = [s for s in pool if s["name"] in args.names]
+        args.all = True
+    offer = [s for s in pool if s["name"] not in live and (args.include_starter or not s.get("starter"))]
+
+    print("Snapshot: %s, %s (%s) — %d %s; source %s" % (
+        snap.get("htag"), time.strftime("%Y-%m-%d %H:%M", time.localtime(snap["snapshot_time"])),
+        ago(snap["snapshot_time"]), len(pool), "closed sessions" if args.closed else "sessions", src))
+    skipped = [s["name"] for s in pool if s["name"] in live]
+    if skipped:
+        print("Already live, skipped: " + ", ".join(skipped))
+    if not offer:
+        print("Nothing to restore.")
+        return
+    print()
+    for i, s in enumerate(offer, 1):
+        cwd, cmd, what = plan_for(s, tag)
+        seen = ago(os.path.getmtime(s["transcript"])) if s.get("transcript") and os.path.exists(s["transcript"]) else ""
+        print("  %2d) %-24s %-10s %-34s %s" % (i, s["name"][:24], cwd[:10], what, seen))
+        if (s.get("purpose") or {}).get("text"):
+            print("      %s" % s["purpose"]["text"][:110])
+    print()
+    if args.all:
+        chosen = list(range(len(offer)))
+    else:
+        if not sys.stdin.isatty():
+            sys.exit("not a terminal — use --all or --dry-run")
+        chosen = parse_pick(input("  a) all    n) none    q) quit     [e.g. 1,3,7-9]: "), len(offer))
+
+    for k, idx in enumerate(chosen):
+        s = offer[idx]
+        cwd, cmd, what = plan_for(s, tag)
+        steps = [TMUX + ["new-session", "-d", "-s", s["name"], "-c", cwd]]
+        if cmd:
+            steps += [TMUX + ["send-keys", "-t", "=" + s["name"] + ":", "-l", cmd],
+                      TMUX + ["send-keys", "-t", "=" + s["name"] + ":", "Enter"]]
+        if args.dry_run:
+            for st in steps:
+                print("  " + " ".join(shlex.quote(x) for x in st))
+            continue
+        if subprocess.run(TMUX + ["has-session", "-t", "=" + s["name"]], capture_output=True).returncode == 0:
+            print("  skip %s — already exists" % s["name"])      # NEVER clobber a live session
+            continue
+        for st in steps:
+            subprocess.run(st, check=True)
+        print("  ✓ %-24s %s" % (s["name"], what))
+        if cmd and k < len(chosen) - 1:
+            time.sleep(args.stagger)
+
+
+TMUX = tmux_bin()
+if __name__ == "__main__":
+    main()

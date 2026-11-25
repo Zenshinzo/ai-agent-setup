@@ -1,0 +1,26 @@
+# Antigravity CLI (agy), isolated in its own container.
+# Run:   docker compose -f docker-compose.yml run --rm -T gemini agy -p "..." < /dev/null
+# Login: docker compose -f docker-compose.yml run --rm gemini agy   (sign-in happens on first run)
+name: gemini
+
+services:
+  gemini:
+    build: .
+    image: local/gemini-agy:1.5.13
+    container_name: gemini
+    user: "2003:2003"
+    working_dir: /work
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=256m
+    volumes:
+      - gemini-home:/home/gemini     # login + agy state only
+      - ./work:/work                 # the ONLY host folder it can see
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 512
+
+volumes:
+  gemini-home:

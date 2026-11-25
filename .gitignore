@@ -1,0 +1,10 @@
+# Never commit what the agents work on, their logins, or any secret.
+docker/*/work/
+docker/agy/agy
+.env
+*.env
+*.token
+*.key
+*.pem
+*webhook*
+!bin/dlog
