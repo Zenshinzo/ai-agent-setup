@@ -15,14 +15,20 @@ else
   TZ=$( [ -r "$VAULT/.vault-tz" ] && tr -d '[:space:]' < "$VAULT/.vault-tz" || true); [ -n "${TZ:-}" ] || TZ="UTC"; export TZ
   SESSION="${NAME}_$(date +%Y-%m-%d_%H%M%S)"
 fi
-# Mark this tmux session as the boot session, so session-restore skips it by default.
+# Mark this tmux session as the boot session, so session-restore skips it by default, and
+# label Claude "<host>: <tmux session>" like the picker does, so snapshots can match it.
+LABEL=()
 if [ -n "${TMUX:-}" ]; then
   STATE="${SESSION_STATE_DIR:-$HOME/.local/state/agent-sessions}"; mkdir -p "$STATE"
-  tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#S' > "$STATE/starter-session" 2>/dev/null || true
+  TSESS=$(tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#S' 2>/dev/null || true)
+  if [ -n "$TSESS" ]; then
+    printf '%s\n' "$TSESS" > "$STATE/starter-session"
+    LABEL=(-n "$NAME: $TSESS")
+  fi
 fi
 cd "$HOME" || exit 1
 while :; do
-  claude --remote-control "$SESSION"
+  claude "${LABEL[@]}" --remote-control "$SESSION"
   printf '\n[claude exited — restarting in 5s; press Ctrl-C now for a shell]\n'
   trap 'trap - INT; exec bash -l' INT
   sleep 5

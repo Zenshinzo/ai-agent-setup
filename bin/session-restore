@@ -59,11 +59,16 @@ def pick_source(args):
         return args.from_file
     if args.closed:
         return LATEST                              # the closed archive rides in every latest.json
-    # prev.json = the last snapshot of an earlier boot/tmux server. Use it if it IS earlier;
-    # otherwise nothing has died since, and latest.json is the right reference.
+    # latest.json from an earlier boot/tmux server: no snapshot has run since, so it holds the
+    # sessions that died. Otherwise prev.json is the last snapshot of the earlier server.
+    now = current_epoch()
+    if os.path.exists(LATEST):
+        l = load(LATEST)
+        if (l.get("boot_id"), l.get("tmux_server_pid"), l.get("tmux_server_start")) != now:
+            return LATEST
     if os.path.exists(PREV):
         p = load(PREV)
-        if (p.get("boot_id"), p.get("tmux_server_pid"), p.get("tmux_server_start")) != current_epoch():
+        if (p.get("boot_id"), p.get("tmux_server_pid"), p.get("tmux_server_start")) != now:
             return PREV
     return LATEST
 

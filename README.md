@@ -25,7 +25,7 @@ Linux or macOS, with tmux, Python 3.9+, and Claude Code. Make sure `~/.local/bin
 
     mkdir -p ~/.local/bin
     for f in bin/*; do install -m 755 "$f" ~/.local/bin/; done
-    cat tmux/tmux.conf >> ~/.tmux.conf
+    grep -q session-snap ~/.tmux.conf 2>/dev/null || cat tmux/tmux.conf >> ~/.tmux.conf
     tmux source-file ~/.tmux.conf 2>/dev/null || true   # if tmux is already running
 
 Snapshot every 10 minutes too, so a session's conversation is on record even if nothing
@@ -53,7 +53,11 @@ On macOS, skip `@reboot`: a tmux server started outside your login session can't
 keychain, so Claude comes up logged out. Open tmux from Terminal instead.
 
 Name each Claude after its session so restore can find it: `claude -n "<host>: <session>"`.
-The picker does this for you. After a reboot, run `session-restore`.
+The picker does this for you.
+
+After a reboot, run `session-restore` and pick from the list (`a` for all), or
+`session-restore --all`. To reopen a session you closed on purpose: `session-restore --closed NAME`.
+Before closing one, `session-restore --check NAME` tells you whether it can be brought back.
 
 Discord mirror for `dlog` (optional): put a channel webhook URL in `~/.config/dlog/webhook`.
 
